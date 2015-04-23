@@ -342,7 +342,7 @@ int ssl3_connect(SSL *s)
             }
 #endif
             /* Check if it is anon DH/ECDH, SRP auth */
-            /* or PSK */
+            /* or plain PSK */
             if (!
                 (s->s3->tmp.
                  new_cipher->algorithm_auth & (SSL_aNULL | SSL_aSRP))
@@ -1424,9 +1424,9 @@ int ssl3_get_key_exchange(SSL *s)
         }
 #ifndef OPENSSL_NO_PSK
         /*
-         * In plain PSK ciphersuite, ServerKeyExchange can be omitted if no
-         * identity hint is sent. Set session->sess_cert anyway to avoid
-         * problems later.
+         * In PSK ciphersuites, ServerKeyExchange can be omitted if no
+         * identity hint is sent. Set session->sess_cert for plain PSK
+         * anyway to avoid problems later.
          */
         if (alg_k & SSL_kPSK) {
             s->session->sess_cert = ssl_sess_cert_new();
@@ -1471,7 +1471,12 @@ int ssl3_get_key_exchange(SSL *s)
     al = SSL_AD_DECODE_ERROR;
 
 #ifndef OPENSSL_NO_PSK
-    if (alg_k & SSL_kPSK) {
+    /* handle PSK identity hint */
+    if (alg_k & SSL_kPSK
+#ifndef OPENSSL_NO_RSA
+                 || alg_k & SSL_kRSAPSK
+#endif
+                 ) {
         param_len = 2;
         if (param_len > n) {
             SSLerr(SSL_F_SSL3_GET_KEY_EXCHANGE, SSL_R_LENGTH_TOO_SHORT);
@@ -2041,7 +2046,7 @@ int ssl3_get_key_exchange(SSL *s)
         }
     } else {
         /* aNULL, aSRP or kPSK do not need public keys */
-        if (!(alg_a & (SSL_aNULL | SSL_aSRP)) && !(alg_k & SSL_kPSK)) {
+        if (!(alg_a & (SSL_aNULL | SSL_aSRP)) && !(alg_k & SSL_kPSK) && !(alg_k & SSL_kRSAPSK)) {
             /* Might be wrong key type, check it */
             if (ssl3_check_cert_and_algorithm(s))
                 /* Otherwise this shouldn't happen */
@@ -3130,7 +3135,11 @@ int ssl3_send_client_key_exchange(SSL *s)
         }
 #endif
 #ifndef OPENSSL_NO_PSK
-        else if (alg_k & SSL_kPSK) {
+        else if (alg_k & SSL_kPSK
+#ifndef OPENSSL_NO_RSA
+                 || alg_k & SSL_kRSAPSK
+#endif
+                 ) {
             /*
              * The callback needs PSK_MAX_IDENTITY_LEN + 1 bytes to return a
              * \0-terminated identity. The last byte is for us for simulating
@@ -3138,8 +3147,8 @@ int ssl3_send_client_key_exchange(SSL *s)
              */
             char identity[PSK_MAX_IDENTITY_LEN + 2];
             size_t identity_len;
-            unsigned char *t = NULL;
             unsigned char psk_or_pre_ms[PSK_MAX_PSK_LEN * 2 + 4];
+            unsigned char *t = psk_or_pre_ms;
             unsigned int pre_ms_len = 0, psk_len = 0;
             int psk_err = 1;
 
@@ -3171,14 +3180,34 @@ int ssl3_send_client_key_exchange(SSL *s)
                        ERR_R_INTERNAL_ERROR);
                 goto psk_err;
             }
-            /* create PSK pre_master_secret */
-            pre_ms_len = 2 + psk_len + 2 + psk_len;
-            t = psk_or_pre_ms;
-            memmove(psk_or_pre_ms + psk_len + 4, psk_or_pre_ms, psk_len);
-            s2n(psk_len, t);
-            memset(t, 0, psk_len);
-            t += psk_len;
-            s2n(psk_len, t);
+
+            if (alg_k & SSL_kPSK) {
+                /* create PSK pre_master_secret */
+                pre_ms_len = 2 + psk_len + 2 + psk_len;
+                memmove(psk_or_pre_ms + psk_len + 4, psk_or_pre_ms, psk_len);
+                s2n(psk_len, t);
+                memset(t, 0, psk_len);
+                t += psk_len;
+                s2n(psk_len, t);
+            }
+#ifndef OPENSSL_NO_RSA
+            else if (alg_k & SSL_kRSAPSK) {
+                const unsigned int pre_ms_prefix = 48;
+
+                pre_ms_len = 2 + 2 + 46 + 2 + psk_len;
+                memmove(psk_or_pre_ms + 52, psk_or_pre_ms, psk_len);
+                s2n(pre_ms_prefix, t);
+
+                psk_or_pre_ms[2] = s->client_version >> 8;
+                psk_or_pre_ms[3] = s->client_version & 0xff;
+                t += 2;
+
+                if (RAND_bytes(psk_or_pre_ms + 4, 46) <= 0)
+                    goto psk_err;
+                t += 46;
+                s2n(psk_len, t);
+            }
+#endif
 
             if (s->session->psk_identity_hint != NULL)
                 OPENSSL_free(s->session->psk_identity_hint);
@@ -3208,8 +3237,41 @@ int ssl3_send_client_key_exchange(SSL *s)
                                                             pre_ms_len);
             s2n(identity_len, p);
             memcpy(p, identity, identity_len);
+            p += identity_len;
             n = 2 + identity_len;
+
+#ifndef OPENSSL_NO_RSA
+            if (alg_k & SSL_kRSAPSK) {
+                RSA *rsa;
+                int enc_n;
+
+                if (s->session->sess_cert->peer_rsa_tmp != NULL) {
+                    rsa = s->session->sess_cert->peer_rsa_tmp;
+                } else {
+                    pkey = X509_get_pubkey(s->session->sess_cert->peer_pkeys[SSL_PKEY_RSA_ENC].x509);
+                    if ((pkey == NULL) || (pkey->type != EVP_PKEY_RSA) || (pkey->pkey.rsa == NULL)) {
+                        SSLerr(SSL_F_SSL3_SEND_CLIENT_KEY_EXCHANGE, ERR_R_INTERNAL_ERROR);
+                        goto psk_err;
+                    }
+                    rsa = pkey->pkey.rsa;
+                    EVP_PKEY_free(pkey);
+                }
+
+                enc_n = RSA_public_encrypt(48, psk_or_pre_ms + 2, p + 2, rsa, RSA_PKCS1_PADDING);
+                if (enc_n <= 0) {
+                    SSLerr(SSL_F_SSL3_SEND_CLIENT_KEY_EXCHANGE, SSL_R_BAD_RSA_ENCRYPT);
+                    goto psk_err;
+                }
+
+                n += enc_n;
+
+                s2n(enc_n, p);
+                n += 2;
+            }
+#endif
+
             psk_err = 0;
+
  psk_err:
             OPENSSL_cleanse(identity, sizeof(identity));
             OPENSSL_cleanse(psk_or_pre_ms, sizeof(psk_or_pre_ms));
@@ -3580,7 +3642,11 @@ int ssl3_check_cert_and_algorithm(SSL *s)
     }
 #endif
 #ifndef OPENSSL_NO_RSA
-    if (alg_k & SSL_kRSA) {
+    if (alg_k & SSL_kRSA
+#ifndef OPENSSL_NO_PSK
+                  || alg_k & SSL_kRSAPSK
+#endif
+          ) {
         if (!SSL_C_IS_EXPORT(s->s3->tmp.new_cipher) &&
             !has_bits(i, EVP_PK_RSA | EVP_PKT_ENC)) {
             SSLerr(SSL_F_SSL3_CHECK_CERT_AND_ALGORITHM,
@@ -3647,7 +3713,11 @@ int ssl3_check_cert_and_algorithm(SSL *s)
     if (SSL_C_IS_EXPORT(s->s3->tmp.new_cipher) &&
         pkey_bits > SSL_C_EXPORT_PKEYLENGTH(s->s3->tmp.new_cipher)) {
 #ifndef OPENSSL_NO_RSA
-        if (alg_k & SSL_kRSA) {
+        if (alg_k & SSL_kRSA
+#ifndef OPENSSL_NO_PSK
+                     || alg_k & SSL_kRSAPSK
+#endif
+                ) {
             if (rsa == NULL) {
                 SSLerr(SSL_F_SSL3_CHECK_CERT_AND_ALGORITHM,
                        SSL_R_MISSING_EXPORT_TMP_RSA_KEY);

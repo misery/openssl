@@ -314,6 +314,8 @@
 # define SSL_kGOST       0x00000200L
 /* SRP */
 # define SSL_kSRP        0x00000400L
+/* RSA PSK */
+# define SSL_kRSAPSK             0x00000800L
 
 /* Bits for algorithm_auth (server authentication) */
 /* RSA auth */
